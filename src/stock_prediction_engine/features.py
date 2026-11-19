@@ -1,5 +1,5 @@
 
-"""Feature engineering for the Stock Prediction Engine."""
+"""Create technical indicators and multi-horizon prediction targets."""
 
 from pathlib import Path
 
@@ -7,30 +7,11 @@ import numpy as np
 import pandas as pd
 
 
-# ============================================================
-# 1. PROJECT CONFIGURATION
-# ============================================================
-
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
 PROCESSED_DATA_DIR = PROJECT_ROOT / "data" / "processed"
 
-PRICE_COLUMN = "Adj Close"
-VOLUME_COLUMN = "Volume"
+TARGET_HORIZONS = (1, 5, 10, 20)
 
-TRADING_DAYS_PER_YEAR = 252
-MARKET_TIMEZONE = "America/New_York"
-
-RSI_PERIOD = 14
-
-SHORT_EMA_PERIOD = 12
-LONG_EMA_PERIOD = 26
-SIGNAL_EMA_PERIOD = 9
-
-
-# ============================================================
-# 2. FEATURE AND TARGET DEFINITIONS
-# ============================================================
 
 FEATURE_COLUMNS = [
     "return_1d",
@@ -48,140 +29,38 @@ FEATURE_COLUMNS = [
     "volume_change",
 ]
 
-TARGET_COLUMNS = [
-    "target_return_1d",
-    "target_return_5d",
-    "target_1d",
-    "target_5d",
+TARGET_RETURN_COLUMNS = [
+    f"target_return_{h}d" for h in TARGET_HORIZONS
 ]
 
+TARGET_CLASS_COLUMNS = [
+    f"target_{h}d" for h in TARGET_HORIZONS
+]
 
-# ============================================================
-# 3. DATA LOADING AND VALIDATION
-# ============================================================
+TARGET_COLUMNS = TARGET_RETURN_COLUMNS + TARGET_CLASS_COLUMNS
 
-def load_feature_source(ticker: str) -> pd.DataFrame:
-    """Load and validate processed historical market data."""
 
-    ticker = ticker.upper()
+def normalize_source_dates(index):
+    """Normalize source dates to timezone-naive New York time."""
 
-    input_path = (
-        PROCESSED_DATA_DIR / f"{ticker}_processed.csv"
+    dates = pd.to_datetime(index, utc=True)
+
+    return (
+        dates.tz_convert("America/New_York")
+        .tz_localize(None)
     )
 
-    print(f"\nLoading processed data for {ticker}...")
-
-    if not input_path.exists():
-        raise FileNotFoundError(
-            f"Processed data not found: {input_path}. "
-            "Run data_processing.py first."
-        )
-
-    data = pd.read_csv(
-        input_path,
-        index_col="Date",
-    )
-
-    if data.empty:
-        raise ValueError(
-            "The processed dataset is empty."
-        )
-
-    required_columns = [
-        PRICE_COLUMN,
-        VOLUME_COLUMN,
-    ]
-
-    missing_columns = [
-        column
-        for column in required_columns
-        if column not in data.columns
-    ]
-
-    if missing_columns:
-        raise ValueError(
-            f"Missing required columns: {missing_columns}"
-        )
-
-    # Normalize dates to the US market timezone.
-    # Yahoo Finance daily data can contain both EST and EDT
-    # offsets because of daylight saving time.
-
-    try:
-        data.index = (
-            pd.to_datetime(data.index, utc=True)
-            .tz_convert(MARKET_TIMEZONE)
-            .tz_localize(None)
-        )
-    except (ValueError, TypeError) as error:
-        raise ValueError(
-            "Unable to parse and normalize dataset dates."
-        ) from error
-
-    data.index.name = "Date"
-
-    # Ensure chronological order.
-    data = data.sort_index().copy()
-
-    if data.index.has_duplicates:
-        raise ValueError(
-            "Duplicate dates detected in the dataset."
-        )
-
-    # Convert relevant columns to numeric values.
-    for column in required_columns:
-        data[column] = pd.to_numeric(
-            data[column],
-            errors="coerce",
-        )
-
-    if data[required_columns].isna().any().any():
-        raise ValueError(
-            "Missing or non-numeric values detected "
-            "in price or volume columns."
-        )
-
-    if not np.isfinite(
-        data[required_columns].to_numpy(dtype=float)
-    ).all():
-        raise ValueError(
-            "Infinite values detected in source data."
-        )
-
-    if (data[PRICE_COLUMN] <= 0).any():
-        raise ValueError(
-            "Adjusted closing prices must be positive."
-        )
-
-    if (data[VOLUME_COLUMN] < 0).any():
-        raise ValueError(
-            "Trading volume cannot be negative."
-        )
-
-    print(f"Source observations: {len(data)}")
-
-    print(
-        f"Date range: {data.index.min().date()} "
-        f"to {data.index.max().date()}"
-    )
-
-    return data
-
-
-# ============================================================
-# 4. TECHNICAL INDICATORS
-# ============================================================
 
 def calculate_rsi(
-    price: pd.Series,
-    period: int = RSI_PERIOD,
+    prices: pd.Series,
+    period: int = 14,
 ) -> pd.Series:
     """Calculate RSI using Wilder-style exponential smoothing."""
 
-    price_change = price.diff()
+    delta = prices.diff()
 
-    gains = price_change.clip(lower=0)
-    losses = -price_change.clip(upper=0)
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
 
     average_gain = gains.ewm(
         alpha=1 / period,
@@ -195,12 +74,13 @@ def calculate_rsi(
         adjust=False,
     ).mean()
 
-    relative_strength = average_gain.div(
-        average_loss.where(average_loss != 0)
-    )
+    relative_strength = average_gain / average_loss
 
-    rsi = 100 - (
-        100 / (1 + relative_strength)
+    rsi = 100 - (100 / (1 + relative_strength))
+
+    rsi = rsi.mask(
+        (average_gain == 0) & (average_loss == 0),
+        50,
     )
 
     rsi = rsi.mask(
@@ -208,364 +88,188 @@ def calculate_rsi(
         100,
     )
 
-    rsi = rsi.mask(
-        (average_loss == 0) & (average_gain == 0),
-        50,
-    )
-
     return rsi
 
 
-def calculate_macd(
-    price: pd.Series,
-) -> pd.DataFrame:
-    """Calculate normalized MACD, signal line and histogram."""
-
-    short_ema = price.ewm(
-        span=SHORT_EMA_PERIOD,
-        min_periods=SHORT_EMA_PERIOD,
-        adjust=False,
-    ).mean()
-
-    long_ema = price.ewm(
-        span=LONG_EMA_PERIOD,
-        min_periods=LONG_EMA_PERIOD,
-        adjust=False,
-    ).mean()
-
-    macd_line = short_ema - long_ema
-
-    signal_line = macd_line.ewm(
-        span=SIGNAL_EMA_PERIOD,
-        min_periods=SIGNAL_EMA_PERIOD,
-        adjust=False,
-    ).mean()
-
-    histogram = macd_line - signal_line
-
-    return pd.DataFrame(
-        {
-            "macd_pct": macd_line / price,
-            "macd_signal_pct": signal_line / price,
-            "macd_hist_pct": histogram / price,
-        },
-        index=price.index,
-    )
-
-
-# ============================================================
-# 5. HISTORICAL FEATURE ENGINEERING
-# ============================================================
-
-def create_historical_features(
-    data: pd.DataFrame,
-) -> pd.DataFrame:
-    """Calculate historical features using past and current data."""
+def create_features(data: pd.DataFrame) -> pd.DataFrame:
+    """Create historical features and future prediction targets."""
 
     data = data.copy()
 
-    price = data[PRICE_COLUMN]
-    volume = data[VOLUME_COLUMN]
+    if "Adj Close" not in data.columns:
+        raise ValueError("Missing Adj Close column.")
 
-    # 5.1 Historical returns
+    if "Volume" not in data.columns:
+        raise ValueError("Missing Volume column.")
 
-    data["return_1d"] = price.pct_change(
-        periods=1,
-        fill_method=None,
-    )
+    price = data["Adj Close"].astype(float)
+    volume = data["Volume"].astype(float)
 
-    data["return_5d"] = price.pct_change(
-        periods=5,
-        fill_method=None,
-    )
+    # 1. Historical returns
+    data["return_1d"] = price.pct_change(1)
+    data["return_5d"] = price.pct_change(5)
+    data["return_20d"] = price.pct_change(20)
 
-    data["return_20d"] = price.pct_change(
-        periods=20,
-        fill_method=None,
-    )
+    # 2. Moving averages
+    sma_5 = price.rolling(window=5).mean()
+    sma_20 = price.rolling(window=20).mean()
+    sma_50 = price.rolling(window=50).mean()
 
-    # 5.2 Simple Moving Averages
+    data["price_to_sma_5"] = price / sma_5 - 1
+    data["price_to_sma_20"] = price / sma_20 - 1
+    data["price_to_sma_50"] = price / sma_50 - 1
 
-    data["sma_5"] = price.rolling(
-        window=5,
-        min_periods=5,
-    ).mean()
-
-    data["sma_20"] = price.rolling(
-        window=20,
-        min_periods=20,
-    ).mean()
-
-    data["sma_50"] = price.rolling(
-        window=50,
-        min_periods=50,
-    ).mean()
-
-    # Normalized distance from moving averages.
-
-    data["price_to_sma_5"] = (
-        price / data["sma_5"]
-    ) - 1
-
-    data["price_to_sma_20"] = (
-        price / data["sma_20"]
-    ) - 1
-
-    data["price_to_sma_50"] = (
-        price / data["sma_50"]
-    ) - 1
-
-    # 5.3 Historical volatility
-
-    daily_returns = data["return_1d"]
+    # 3. Historical volatility
+    daily_returns = price.pct_change()
 
     data["volatility_10d"] = (
-        daily_returns
-        .rolling(window=10, min_periods=10)
-        .std()
-        * np.sqrt(TRADING_DAYS_PER_YEAR)
+        daily_returns.rolling(window=10).std()
+        * np.sqrt(252)
     )
 
     data["volatility_20d"] = (
-        daily_returns
-        .rolling(window=20, min_periods=20)
-        .std()
-        * np.sqrt(TRADING_DAYS_PER_YEAR)
+        daily_returns.rolling(window=20).std()
+        * np.sqrt(252)
     )
 
-    # 5.4 Relative Strength Index
+    # 4. RSI
+    data["rsi_14"] = calculate_rsi(price, period=14)
 
-    data["rsi_14"] = calculate_rsi(
-        price,
-        period=RSI_PERIOD,
-    )
+    # 5. MACD
+    ema_12 = price.ewm(span=12, adjust=False).mean()
+    ema_26 = price.ewm(span=26, adjust=False).mean()
 
-    # 5.5 MACD
+    macd = ema_12 - ema_26
 
-    macd_features = calculate_macd(price)
+    macd_signal = macd.ewm(
+        span=9,
+        adjust=False,
+    ).mean()
 
-    data = data.join(macd_features)
+    macd_histogram = macd - macd_signal
 
-    # 5.6 Volume variation
+    data["macd_pct"] = macd / price
+    data["macd_signal_pct"] = macd_signal / price
+    data["macd_hist_pct"] = macd_histogram / price
 
-    data["volume_change"] = volume.pct_change(
-        periods=1,
-        fill_method=None,
-    )
+    # 6. Volume
+    data["volume_change"] = volume.pct_change()
 
-    return data
+    # 7. Future returns and classification targets
+    for horizon in TARGET_HORIZONS:
 
+        future_return = (
+            price.shift(-horizon) / price - 1
+        )
 
-# ============================================================
-# 6. FUTURE TARGET GENERATION
-# ============================================================
+        return_column = f"target_return_{horizon}d"
+        class_column = f"target_{horizon}d"
 
-def create_targets(
-    data: pd.DataFrame,
-) -> pd.DataFrame:
-    """Create future-return and future-direction targets."""
+        data[return_column] = future_return
 
-    data = data.copy()
+        data[class_column] = (
+            future_return > 0
+        ).astype(float)
 
-    price = data[PRICE_COLUMN]
+        data.loc[
+            future_return.isna(),
+            class_column,
+        ] = np.nan
 
-    # Future returns.
-
-    future_return_1d = (
-        price.shift(-1) / price
-    ) - 1
-
-    future_return_5d = (
-        price.shift(-5) / price
-    ) - 1
-
-    data["target_return_1d"] = future_return_1d
-    data["target_return_5d"] = future_return_5d
-
-    # Classification:
-    # 1 = positive future return.
-    # 0 = zero or negative future return.
-    # Missing future observations remain missing.
-
-    data["target_1d"] = (
-        future_return_1d > 0
-    ).astype(float).where(
-        future_return_1d.notna()
-    )
-
-    data["target_5d"] = (
-        future_return_5d > 0
-    ).astype(float).where(
-        future_return_5d.notna()
-    )
-
-    return data
-
-
-# ============================================================
-# 7. FINAL DATASET PREPARATION
-# ============================================================
-
-def prepare_feature_dataset(
-    data: pd.DataFrame,
-) -> pd.DataFrame:
-    """Remove unusable observations and validate the final dataset."""
-
-    data = data.copy()
-
-    required_output_columns = (
-        FEATURE_COLUMNS + TARGET_COLUMNS
-    )
-
-    data = data.replace(
-        [np.inf, -np.inf],
-        np.nan,
-    )
-
-    original_rows = len(data)
+    # 8. Remove unavailable features and targets
+    required_columns = FEATURE_COLUMNS + TARGET_COLUMNS
 
     data = data.dropna(
-        subset=required_output_columns
+        subset=required_columns
     ).copy()
 
-    removed_rows = original_rows - len(data)
-
-    if data.empty:
-        raise ValueError(
-            "No usable observations remain after "
-            "feature engineering."
-        )
-
-    data["target_1d"] = data["target_1d"].astype(int)
-    data["target_5d"] = data["target_5d"].astype(int)
-
-    if not data["rsi_14"].between(0, 100).all():
-        raise ValueError(
-            "Invalid RSI values detected."
-        )
-
-    if not np.isfinite(
-        data[FEATURE_COLUMNS].to_numpy(dtype=float)
-    ).all():
-        raise ValueError(
-            "Non-finite values detected in features."
-        )
-
-    print("\nDataset preparation completed.")
-    print(f"Original rows: {original_rows}")
-    print(f"Removed rows: {removed_rows}")
-    print(f"Usable rows: {len(data)}")
+    for column in TARGET_CLASS_COLUMNS:
+        data[column] = data[column].astype(int)
 
     return data
 
 
-# ============================================================
-# 8. MAIN FEATURE ENGINEERING PIPELINE
-# ============================================================
-
-def create_features(
+def build_feature_dataset(
     ticker: str = "AAPL",
 ) -> pd.DataFrame:
-    """Execute the complete feature engineering pipeline."""
+    """Build and save the multi-horizon feature dataset."""
 
     ticker = ticker.upper()
+
+    input_path = (
+        PROCESSED_DATA_DIR / f"{ticker}_processed.csv"
+    )
+
+    output_path = (
+        PROCESSED_DATA_DIR / f"{ticker}_features.csv"
+    )
+
+    if not input_path.exists():
+        raise FileNotFoundError(input_path)
 
     print("\n" + "=" * 60)
     print(f"FEATURE ENGINEERING: {ticker}")
     print("=" * 60)
 
-    # Step 1: Load and validate source data.
-    data = load_feature_source(ticker)
+    source = pd.read_csv(
+        input_path,
+        index_col="Date",
+    )
 
-    # Step 2: Calculate historical features.
-    data = create_historical_features(data)
+    source.index = normalize_source_dates(source.index)
+    source.index.name = "Date"
+    source = source.sort_index()
 
-    # Step 3: Generate future prediction targets.
-    data = create_targets(data)
+    if source.index.has_duplicates:
+        raise ValueError("Duplicate source dates detected.")
 
-    # Step 4: Prepare the final dataset.
-    data = prepare_feature_dataset(data)
+    print(f"Source observations: {len(source)}")
 
-    # Step 5: Save the dataset.
-    output_path = (
-        PROCESSED_DATA_DIR / f"{ticker}_features.csv"
+    data = create_features(source)
+
+    PROCESSED_DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
     data.to_csv(output_path)
 
-    # Summary.
-
-    print("\n" + "=" * 60)
-    print("FEATURE ENGINEERING SUMMARY")
-    print("=" * 60)
-
-    print(f"Ticker: {ticker}")
-    print(f"Observations: {len(data)}")
+    print("\nFeature engineering completed.")
+    print(f"Final observations: {len(data)}")
     print(f"Total columns: {len(data.columns)}")
     print(f"ML features: {len(FEATURE_COLUMNS)}")
-    print(f"Prediction targets: {len(TARGET_COLUMNS)}")
 
-    print(
-        f"Date range: {data.index.min().date()} "
-        f"to {data.index.max().date()}"
-    )
+    print("\nPrediction targets:")
 
-    print(f"\nDataset saved to:\n{output_path}")
-
-    print("\nTarget distribution - 1 trading session:")
-
-    print(
-        data["target_1d"]
-        .value_counts(normalize=True)
-        .sort_index()
-        .rename(
-            index={
-                0: "Down or unchanged",
-                1: "Up",
-            }
+    for horizon in TARGET_HORIZONS:
+        print(
+            f"  {horizon} days: "
+            f"target_return_{horizon}d, "
+            f"target_{horizon}d"
         )
-    )
 
-    print("\nTarget distribution - 5 trading sessions:")
+    print(f"\nStart date: {data.index.min()}")
+    print(f"End date:   {data.index.max()}")
 
-    print(
-        data["target_5d"]
-        .value_counts(normalize=True)
-        .sort_index()
-        .rename(
-            index={
-                0: "Down or unchanged",
-                1: "Up",
-            }
+    print("\nTarget distributions:")
+
+    for horizon in TARGET_HORIZONS:
+        column = f"target_{horizon}d"
+
+        distribution = (
+            data[column]
+            .value_counts(normalize=True)
+            .sort_index()
+            .rename(index={0: "Down", 1: "Up"})
         )
-    )
 
-    print("\nFeature columns:")
+        print(f"\n{horizon}-day target:")
+        print(distribution.round(4))
 
-    for feature in FEATURE_COLUMNS:
-        print(f" - {feature}")
-
-    print("\nTarget columns:")
-
-    for target in TARGET_COLUMNS:
-        print(f" - {target}")
+    print(f"\nSaved to: {output_path}")
 
     return data
 
 
-# ============================================================
-# 9. SCRIPT EXECUTION
-# ============================================================
-
 if __name__ == "__main__":
-
-    df = create_features("AAPL")
-
-    print("\nFirst 5 observations:")
-    print(df.head())
-
-    print("\nDataset information:")
-    df.info()
-
-    print("\nFeature statistics:")
-    print(df[FEATURE_COLUMNS].describe())
+    build_feature_dataset()
